@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""huddle — ask the user a rich question as a page over this herdr pane and print the answer as JSON.
+
+  huddle SPEC.json | huddle - < spec.json      ask from a JSON spec (see SKILL.md for the schema)
+  huddle q "Prompt" "Label|subtitle" "*Recommended|subtitle" ... [--multi] [--context MD]
+  huddle demo [NAME ...]                       open bundled demos (no name: list them)
+  huddle templates                             list templates with their one-line purpose
+  huddle render SPEC -o FILE                   build the page only, open nothing
+
+Inside herdr (HERDR_ENV=1, plugin ivolkoff.huddle installed) the page opens in terminal-browser zoomed
+over this pane; elsewhere, or with --browser, in the default browser.
+
+Common flags: --timeout SEC (default 86400), --browser (default browser even inside herdr).
+
+Exit codes: 0 answered or "chat" (user wants to discuss in the terminal), 2 dismissed (closed
+unanswered), 3 no way to show it, 4 timed out, 1 error.
+
+Environment: HUDDLE_CONFIG (personal defaults, default ~/.config/huddle/defaults.json),
+HUDDLE_NO_BROWSER=1 (outside herdr, exit 3 instead of opening a browser).
+"""
+import argparse
+import base64
+import glob
+import http.client
+import http.server
+import json
+import mimetypes
+import os
+import shutil
+import socket
+import socketserver
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import webbrowser
+
+HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+RUNTIME = os.path.join(HERE, "runtime")
+TEMPLATES = os.path.join(HERE, "templates")
+DEMOS = os.path.join(HERE, "demos")
+CACHE = os.path.expanduser("~/.cache/huddle")
+DEFAULTS = os.path.join(HERE, "defaults.json")
+USER_DEFAULTS = os.path.expanduser(os.environ.get("HUDDLE_CONFIG", "~/.config/huddle/defaults.json"))
+MERMAID_URL = "https://cdn.jsdelivr.net/npm/mermaid@11.12.0/dist/mermaid.min.js"
+MERMAID_FILE = os.path.join(CACHE, "mermaid-11.12.0.min.js")
+MAX_IMAGE = 8 * 1024 * 1024
+HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+
+
+def die(msg, code=1):
+    print(json.dumps({"status": "error", "error": msg}))
+    sys.exit(code)
+
+
+# ---------- spec loading ----------
+
+def load_spec(arg):
+    if arg in (None, "-"):
+        if sys.stdin.isatty():
+            die("no spec: pass a JSON file or pipe one on stdin")
+        raw = sys.stdin.read()
+    else:
+        with open(os.path.expanduser(arg), encoding="utf-8") as f:
+            raw = f.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"spec is not valid JSON: {e}")
+
+
+def check_spec(spec):
+    if not isinstance(spec, dict):
+        die("spec must be a JSON object")
+    qs = spec.get("questions", [spec])
+    if not isinstance(qs, list) or not qs:
+        die("`questions` must be a non-empty list")
+    ids = set()
+    for i, q in enumerate(qs):
+        qid = q.get("id") or (f"q{i + 1}" if spec.get("questions") else "answer")
+        if qid in ids:
+            die(f"duplicate question id {qid!r}")
+        ids.add(qid)
+        opts = q.get("options") or []
+        if len(opts) > 9:
+            die(f"question {qid!r} has {len(opts)} options; keys 1-9 cover at most 9 (aim for 6)")
+        oids = [o if isinstance(o, str) else o.get("id") or f"o{j + 1}" for j, o in enumerate(opts)]  # as the runtime assigns them
+        if len(oids) != len(set(oids)):
+            die(f"question {qid!r} has duplicate option ids (an option without an id is o1, o2, … by position)")
+        if not q.get("prompt") and not spec.get("title"):
+            die(f"question {qid!r} has no prompt")
+
+
+def embed_images(node, base):
+    """Replace local `image` paths with data URIs: the page is served from memory and has no file access."""
+    if isinstance(node, dict):
+        for k, v in list(node.items()):
+            if k == "image" and isinstance(v, str) and not v.startswith(("http://", "https://", "data:")):
+                p = os.path.expanduser(v)
+                if not os.path.isabs(p):
+                    p = os.path.join(base, p)
+                if not os.path.isfile(p):
+                    node[k] = ""
+                    node.setdefault("alt", f"missing image: {v}")
+                    continue
+                if os.path.getsize(p) > MAX_IMAGE:
+                    die(f"image too large to embed (>8MB): {v}")
+                mime = mimetypes.guess_type(p)[0] or "image/png"
+                with open(p, "rb") as f:
+                    node[k] = f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+            else:
+                embed_images(v, base)
+    elif isinstance(node, list):
+        for v in node:
+            embed_images(v, base)
+
+
+def uses_mermaid(node):
+    if isinstance(node, dict):
+        return "mermaid" in node or any(uses_mermaid(v) for v in node.values())
+    if isinstance(node, list):
+        return any(uses_mermaid(v) for v in node)
+    return False
+
+
+def mermaid_js():
+    if os.path.isfile(MERMAID_FILE) and os.path.getsize(MERMAID_FILE) > 100_000:
+        with open(MERMAID_FILE, encoding="utf-8") as f:
+            return f.read()
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with urllib.request.urlopen(MERMAID_URL, timeout=20) as r:
+            data = r.read().decode("utf-8")
+        with open(MERMAID_FILE, "w", encoding="utf-8") as f:
+            f.write(data)
+        return data
+    except (OSError, UnicodeDecodeError, http.client.HTTPException) as e:  # diagrams fall back to their source text
+        print(f"huddle: mermaid unavailable ({e}); diagrams show as source", file=sys.stderr)
+        return ""
+
+
+def build_html(spec, base):
+    embed_images(spec, base)
+    def read(name):
+        with open(os.path.join(RUNTIME, name), encoding="utf-8") as f:
+            return f.read()
+    css, js = read("huddle.css"), read("huddle.js")
+    mm = mermaid_js() if uses_mermaid(spec) else ""
+    data = json.dumps(spec, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
+    title = spec.get("title") or (spec.get("questions") or [spec])[0].get("prompt") or "Question"
+    esc = lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>{esc(title)[:120]}</title><style>{css}</style></head>"
+        f"<body><div id=\"app\"></div><script type=\"application/json\" id=\"hd-spec\">{data}</script>"
+        + (f"<script>{mm}</script>" if mm else "")
+        + f"<script>{js}</script></body></html>"
+    )
+
+
+def defaults():
+    """The skill's neutral defaults.json, overlaid by the user's own file (HUDDLE_CONFIG)."""
+    merged = {}
+    for path in (DEFAULTS, USER_DEFAULTS):
+        try:
+            with open(path, encoding="utf-8") as f:
+                merged.update(json.load(f))
+        except FileNotFoundError:
+            pass
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"huddle: ignoring {path}: {e}", file=sys.stderr)
+    return merged
+
+
+def apply_defaults(spec):
+    d = defaults()
+    spec.setdefault("style", d.get("style", "refined"))
+    spec.setdefault("review", d.get("review", "auto"))
+    return spec
+
+
+# ---------- herdr ----------
+
+def in_herdr():
+    return os.environ.get("HERDR_ENV") == "1" and os.environ.get("HERDR_PANE_ID") and shutil.which(HERDR)
+
+
+def pane_id(pane_file):
+    try:
+        with open(pane_file, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def snapshot():
+    r = subprocess.run([HERDR, "api", "snapshot"], capture_output=True, text=True)
+    return json.loads(r.stdout)["result"]["snapshot"]
+
+
+def pane_layout(snap, pane):
+    return next((l for l in snap["layouts"] if any(p["pane_id"] == pane for p in l["panes"])), None)
+
+
+def pane_closed(pane_file):
+    pane = pane_id(pane_file)
+    if not pane:
+        return False
+    try:
+        return pane_layout(snapshot(), pane) is None
+    except (json.JSONDecodeError, KeyError):
+        return False
+
+
+# Chromium keeps zoom per host, and terminal-browser changes it when the herdr client's cell size changes
+def reset_zoom(pane_file):
+    pane = pane_id(pane_file)
+    if pane:
+        subprocess.run([HERDR, "pane", "send-keys", pane, "ctrl+0"], stdout=subprocess.DEVNULL)
+
+
+# back in the workspace, herdr refocuses the previous pane, and the zoomed overlay shows it instead of the page
+def keep_focus(pane_file):
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(os.environ["HERDR_SOCKET_PATH"])
+        s.sendall(b'{"id":"huddle","method":"events.subscribe","params":{"subscriptions":'
+                  b'[{"type":"workspace.focused"},{"type":"tab.focused"}]}}\n')
+        for _ in s.makefile():
+            pane = pane_id(pane_file)
+            if not pane:
+                continue
+            snap = snapshot()
+            layout = pane_layout(snap, pane)
+            if layout and layout["tab_id"] == snap["focused_tab_id"] and layout["zoomed"] and layout["focused_pane_id"] != pane:
+                subprocess.run([HERDR, "plugin", "pane", "focus", pane], stdout=subprocess.DEVNULL)
+
+
+def open_pane(url):
+    pane_file = os.path.join(tempfile.mkdtemp(), "pane")  # the pane writes its own id here
+    r = subprocess.run(
+        [HERDR, "plugin", "pane", "open", "--plugin", "ivolkoff.huddle", "--entrypoint", "page",
+         "--placement", "zoomed", "--target-pane", os.environ["HERDR_PANE_ID"], "--no-focus",
+         "--env", f"HUDDLE_URL={url}", "--env", f"HUDDLE_PANE_FILE={pane_file}"],
+        capture_output=True, text=True)
+    if r.returncode:
+        die(f"herdr could not open the page ({(r.stderr or r.stdout).strip()}); "
+            "install the plugin: herdr plugin install ivolkoff/herdr-huddle", 3)
+    threading.Thread(target=keep_focus, args=(pane_file,), daemon=True).start()
+    return pane_file
+
+
+# ---------- serving the page ----------
+
+RELOAD_GRACE = 3  # seconds a dismissal waits for the page to come back (a reload also unloads it)
+
+
+def ask_page(html, timeout, herdr):
+    state = {"answer": None, "dismissed_at": None, "gen": 0}
+    done = threading.Event()
+    pane_file = None
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            state["dismissed_at"] = None  # the page is back: that unload was a reload
+            state["gen"] += 1
+            body = html.replace('<div id="app">', f'<script>window.HD_GEN={state["gen"]}</script><div id="app">', 1).encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            if pane_file:
+                reset_zoom(pane_file)
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(204)
+            self.end_headers()
+            if self.path == "/zoom":
+                if pane_file:
+                    reset_zoom(pane_file)
+                return
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                body = {}
+            if body.get("status") == "dismissed":
+                # on reload the old page's beacon may arrive after the new page's GET
+                if body.get("gen") == state["gen"]:
+                    state["dismissed_at"] = time.time()
+            else:
+                state["answer"] = body
+                done.set()
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    if herdr:
+        pane_file = open_pane(url)
+    elif webbrowser.open(url):
+        print(f"huddle: opened {url}", file=sys.stderr)
+    else:
+        srv.shutdown()
+        die("not inside herdr and no browser could be opened", 3)
+    deadline = time.time() + timeout
+    try:
+        while not done.wait(0.5):
+            gone = state["dismissed_at"]
+            if (gone and time.time() - gone > RELOAD_GRACE) or (pane_file and pane_closed(pane_file)):
+                print(json.dumps({"status": "dismissed"}))
+                return 2
+            if time.time() > deadline:  # the server is gone with this process, so it cannot be resumed
+                print(json.dumps({"status": "timeout", "hint": "the page cannot be resumed; ask again with a longer --timeout"}))
+                return 4
+        print(json.dumps(state["answer"], ensure_ascii=False, indent=1))
+        return 0
+    finally:
+        srv.shutdown()
+        if pane_file and pane_id(pane_file):
+            subprocess.run([HERDR, "plugin", "pane", "close", pane_id(pane_file)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------- commands ----------
+
+def ask(spec, a, base):
+    check_spec(spec)
+    apply_defaults(spec)
+    if a.style:
+        spec["style"] = a.style
+    if a.review:
+        spec["review"] = a.review
+    html = build_html(spec, base)
+    herdr = not a.browser and in_herdr()
+    if not herdr and not a.browser and os.environ.get("HUDDLE_NO_BROWSER"):
+        die("not inside herdr and HUDDLE_NO_BROWSER is set", 3)
+    return ask_page(html, a.timeout, herdr)
+
+
+def quick_spec(a):
+    opts = []
+    for i, raw in enumerate(a.options):
+        rec = raw.startswith("*")
+        label, _, sub = raw.lstrip("*").partition("|")
+        o = {"id": f"o{i + 1}", "label": label.strip()}
+        if sub.strip():
+            o["subtitle"] = sub.strip()
+        if rec:
+            o["recommended"] = True
+        opts.append(o)
+    spec = {"prompt": a.prompt, "options": opts}
+    if a.multi:
+        spec["mode"] = "multi"
+    if a.context:
+        spec["context"] = a.context
+    if a.title:
+        spec["title"] = a.title
+    if opts:
+        spec["width"] = "narrow"
+    return spec
+
+
+def list_dir(d):
+    rows = []
+    for p in sorted(glob.glob(os.path.join(d, "*.json"))):
+        try:
+            with open(p, encoding="utf-8") as f:
+                s = json.load(f)
+            rows.append((os.path.basename(p)[:-5], s.get("_about", "")))
+        except (OSError, json.JSONDecodeError) as e:
+            rows.append((os.path.basename(p)[:-5], f"(unreadable: {e})"))
+    return rows
+
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--style", choices=["refined", "minimal", "bold", "terminal"], help="visual style (default from defaults.json)")
+    common.add_argument("--review", choices=["auto", "always", "never"], help="show the answer review before sending")
+    common.add_argument("--timeout", type=float, default=86400, help="seconds to wait (default a day)")
+    common.add_argument("--browser", action="store_true", help="use the default browser even inside herdr")
+
+    argv = sys.argv[1:]
+    sub = argv[0] if argv and argv[0] in ("q", "demo", "templates", "render", "ask") else None
+    if sub is None:
+        argv = ["ask", *argv]
+        sub = "ask"
+
+    p = argparse.ArgumentParser(prog="huddle", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="cmd")
+    s_ask = sp.add_parser("ask", parents=[common]); s_ask.add_argument("spec", nargs="?")
+    s_q = sp.add_parser("q", parents=[common]); s_q.add_argument("prompt"); s_q.add_argument("options", nargs="*")
+    s_q.add_argument("--multi", action="store_true"); s_q.add_argument("--context"); s_q.add_argument("--title")
+    s_d = sp.add_parser("demo", parents=[common]); s_d.add_argument("names", nargs="*")
+    sp.add_parser("templates")
+    s_r = sp.add_parser("render"); s_r.add_argument("spec"); s_r.add_argument("-o", "--out", required=True)
+    a = p.parse_args(argv)
+
+    if a.cmd == "ask":
+        base = os.path.dirname(os.path.abspath(a.spec)) if a.spec not in (None, "-") else os.getcwd()
+        sys.exit(ask(load_spec(a.spec), a, base))
+    if a.cmd == "q":
+        sys.exit(ask(quick_spec(a), a, os.getcwd()))
+    if a.cmd == "templates":
+        for name, about in list_dir(TEMPLATES):
+            print(f"{name:18} {about}")
+        print(f"\n{TEMPLATES}")
+        return
+    if a.cmd == "demo":
+        if not a.names:
+            for name, about in list_dir(DEMOS) + list_dir(TEMPLATES):
+                print(f"{name:18} {about}")
+            return
+        code = 0
+        for name in a.names:
+            path = next((os.path.join(d, name + ".json") for d in (DEMOS, TEMPLATES) if os.path.isfile(os.path.join(d, name + ".json"))), None)
+            if not path:
+                die(f"no demo or template named {name!r}")
+            code = ask(load_spec(path), a, os.path.dirname(path))
+            if code not in (0, 2):
+                break
+        sys.exit(code)
+    if a.cmd == "render":
+        spec = apply_defaults(load_spec(a.spec))
+        check_spec(spec)
+        base = os.path.dirname(os.path.abspath(a.spec)) if a.spec != "-" else os.getcwd()
+        with open(a.out, "w", encoding="utf-8") as f:
+            f.write(build_html(spec, base))
+        print(a.out)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+id = "ivolkoff.huddle"
+name = "Huddle"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Agents ask rich questions as a page over their pane and get the answer back as JSON"
+platforms = ["macos", "linux"]
+
+# the pane writes its id to a file: only bin/huddle can close the overlay after the answer
+# without PIXEL_DISPLAY_SCALE terminal-browser takes the scale of the screen under the cursor (Retina 2x vs external 1x)
+[[panes]]
+id = "page"
+title = "Huddle"
+placement = "overlay"
+command = ["bash", "-c", "echo \"$HERDR_PANE_ID\" > \"$HUDDLE_PANE_FILE\"; PIXEL_DISPLAY_SCALE=\"${PIXEL_DISPLAY_SCALE:-1}\" exec terminal-browser open \"$HUDDLE_URL\" --no-merge"]
