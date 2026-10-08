@@ -340,7 +340,7 @@
   if (SPEC.width === "narrow") app.classList.add("narrow");
   document.getElementById("app").appendChild(app);
 
-  const top = $("div", "hd-top", `<span class="hd-dot"></span><span class="hd-src">${esc(SPEC.source || "Claude is asking")}</span>${SPEC.subtitle ? `<span class="hd-subt">${esc(SPEC.subtitle)}</span>` : ""}`);
+  const top = $("div", "hd-top", `<span class="hd-dot"></span><span class="hd-src">${esc(SPEC.source || "Your agent is asking")}</span>${SPEC.subtitle ? `<span class="hd-subt">${esc(SPEC.subtitle)}</span>` : ""}`);
   app.appendChild(top);
   if (SPEC.title) app.appendChild($("div", "hd-title", inline(SPEC.title)));
   // One question: the question comes first and its evidence under it. Several: shared context above the tabs.
