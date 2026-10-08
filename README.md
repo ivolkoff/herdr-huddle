@@ -34,15 +34,22 @@ HUDDLE="$(herdr plugin list --json --plugin ivolkoff.huddle | jq -r '.result.plu
 
 ### As an agent skill
 
-`SKILL.md` in the repository root teaches an agent the spec format and when to use huddle. For Claude Code,
-link the plugin checkout as a skill:
+`SKILL.md` in the repository root teaches an agent the spec format and when to use huddle. For Codex CLI:
 
 ```bash
+mkdir -p ~/.agents/skills
+ln -s "$HUDDLE" ~/.agents/skills/huddle
+```
+
+For Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills
 ln -s "$HUDDLE" ~/.claude/skills/huddle
 ```
 
-The skill calls `~/.claude/skills/huddle/bin/huddle`. Other agents: point them at `SKILL.md` and use the
-`bin/huddle` path next to it.
+Codex can invoke the skill explicitly as `$huddle`; if it is not listed in `/skills`, restart Codex. The
+skill calls `bin/huddle` next to its `SKILL.md`. Other agents can also use that file and CLI path.
 
 ## Usage
 

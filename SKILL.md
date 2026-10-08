@@ -1,6 +1,6 @@
 ---
 name: huddle
-description: Ask the user a question as a page in terminal-browser over the herdr pane instead of the built-in AskUserQuestion. Ready-made components — choice (up to 9 options, grey subtitles, a "Recommended" badge with the reason, pros and cons, details), a visual answer (diagrams, charts, mockups, color, radius and spacing samples), sliders with a live preview for taste values (radius, spacing, color, speed), several questions on one page with an answer summary, a free-text field under every question; context — markdown, mermaid, charts, stat tiles, tables, code and diffs; keyboard everywhere. The agent writes a short JSON spec (or one `huddle q` line) and gets the answer back as JSON. Use it whenever you need a decision or input from the user inside herdr (HERDR_ENV=1), and when the user says huddle, "ask with a picture", "show me the options", or asks for a question with diagrams, charts or sliders.
+description: Use when an agent inside herdr (HERDR_ENV=1) needs a decision or input from the user, or when the user asks for huddle, a question with pictures, diagrams, charts, previews, or sliders.
 ---
 
 # huddle — ask with a page, not a prompt
@@ -9,8 +9,11 @@ One command opens the question zoomed over the pane of **this** herdr session, w
 prints it as JSON. The runtime (layout, styles, charts, diagrams, sliders, keyboard) is done; you only
 describe the question.
 
+Set `H` to `bin/huddle` next to this `SKILL.md`. These are the usual skill locations:
+
 ```bash
-H=~/.claude/skills/huddle/bin/huddle   # bin/huddle next to this SKILL.md
+H="$HOME/.agents/skills/huddle/bin/huddle"  # Codex
+[ -f "$H" ] || H="$HOME/.claude/skills/huddle/bin/huddle"  # Claude Code
 ```
 
 Requires: herdr (`HERDR_ENV=1`), plugin `ivolkoff.huddle` in `herdr plugin list`
@@ -19,10 +22,11 @@ opens in the default browser.
 
 ## Running
 
-Always with `run_in_background: true`. The script exits when the user answers or closes the pane, and the
-finished background task brings you back into the session by itself. Do not poll and do not wait with
-`sleep`. Say in one line in the chat that the question is open, and end your turn. The answer is in the
-task output.
+The command waits for the user's answer and prints JSON to stdout. Keep its process and output attached to
+your agent session. In Claude Code, use `run_in_background: true`; the completed task brings you back, so
+say that the question is open and end your turn. In Codex CLI, start it with a short `yield_time_ms` and,
+if the command returns a session ID, collect the result with `write_stdin` on that session. Do not use
+`sleep` or start a detached process that loses stdout. Say in one line that the question is open.
 
 Write questions and options in the user's language.
 
@@ -112,7 +116,7 @@ files; `python3 $H demo NAME` opens one.
 
 ## Spec reference
 
-Top level: `title`, `subtitle`, `source` (replaces "Claude is asking"), `context` (blocks),
+Top level: `title`, `subtitle`, `source` (replaces "Your agent is asking"), `context` (blocks),
 `width: "narrow"` (for short questions), `submitLabel`, `chat: false` (hide Discuss in chat), `script`
 (JS, see [Extending](#extending)), `style`, `review` (see [Look and summary](#look-and-summary)) and
 **either** the fields of a single question **or** `questions: [...]` (tabs, answered in order).

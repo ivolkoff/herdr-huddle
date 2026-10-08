@@ -34,15 +34,23 @@ HUDDLE="$(herdr plugin list --json --plugin ivolkoff.huddle | jq -r '.result.plu
 
 ### Как скил агента
 
-`SKILL.md` в корне репозитория объясняет агенту формат спеки и когда звать huddle. Для Claude Code
-подключите папку плагина как скил:
+`SKILL.md` в корне репозитория объясняет агенту формат спеки и когда звать huddle. Для Codex CLI:
 
 ```bash
+mkdir -p ~/.agents/skills
+ln -s "$HUDDLE" ~/.agents/skills/huddle
+```
+
+Для Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills
 ln -s "$HUDDLE" ~/.claude/skills/huddle
 ```
 
-Скил вызывает `~/.claude/skills/huddle/bin/huddle`. Другим агентам дайте `SKILL.md` и путь `bin/huddle`
-рядом с ним. Текст скила на английском.
+В Codex скил можно явно вызвать как `$huddle`; если его нет в `/skills`, перезапустите Codex. Скил
+вызывает `bin/huddle` рядом со своим `SKILL.md`. Другим агентам тоже можно дать этот файл и путь к CLI.
+Текст скила на английском.
 
 ## Использование
 

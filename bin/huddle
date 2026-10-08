@@ -177,6 +177,7 @@ def defaults():
 
 def apply_defaults(spec):
     d = defaults()
+    spec.setdefault("source", "Your agent is asking")
     spec.setdefault("style", d.get("style", "refined"))
     spec.setdefault("review", d.get("review", "auto"))
     return spec
