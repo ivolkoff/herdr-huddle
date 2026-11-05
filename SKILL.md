@@ -1,6 +1,6 @@
 ---
 name: huddle
-description: Ask the user a question as a page in terminal-browser over the herdr pane instead of the built-in AskUserQuestion. Ready-made components — choice (up to 9 options, grey subtitles, a "Recommended" badge with the reason, pros and cons, details), a visual answer (diagrams, charts, mockups, color, radius and spacing samples), sliders with a live preview for taste values (radius, spacing, color, speed), several questions on one page with an answer summary, a free-text field under every question; context — markdown, mermaid, charts, stat tiles, tables, code and diffs; keyboard everywhere. The agent writes a short JSON spec (or one `huddle q` line) and gets the answer back as JSON. Use it whenever you need a decision or input from the user inside herdr (HERDR_ENV=1), and when the user says huddle, "ask with a picture", "show me the options", or asks for a question with diagrams, charts or sliders.
+description: Ask the user a question as a page in terminal-browser over the herdr pane instead of the built-in AskUserQuestion. Ready-made components — choice (up to 9 options, grey subtitles, a "Recommended" badge with the reason, pros and cons, details), a visual answer (diagrams, charts, mockups, color, radius and spacing samples), sliders with a live preview for taste values (radius, spacing, color, speed), several questions on one page with an answer summary, a free-text field under every question; context — markdown, mermaid, charts, stat tiles, tables, code and diffs; keyboard everywhere. The agent writes a short JSON spec (or one `huddle q` line) and gets the answer back as JSON. Use it whenever you need a decision or input from the user inside herdr (HERDR_ENV=1), and when the user says huddle, "ask with a picture", "show me the options", or asks for a question with diagrams, charts or sliders. Also the way to put a diagram, a report or live progress over the pane with no question at all; anything that updates on the page uses htmx.
 ---
 
 # huddle — ask with a page, not a prompt
@@ -77,6 +77,7 @@ The question is the largest thing on the page; everything else supports it.
 | a number or color by taste, no standard scale (radius, spacing, hue, speed, size, weight, delay) | **`controls`** — sliders with a live preview | `tune` |
 | words | `mode: "text"` | `text` |
 | several related decisions | `questions: [...]` — tabs, then a summary of all answers | `design-tokens` |
+| nothing, the page only shows something | no `options`, `"text": false`, `"optional": true`, `"submitLabel": "Close"`; the blocks go in `context` | — |
 
 Standard values exist (4/8/16 px, a design-system scale) — offer them as options with previews. The value is
 continuous or purely a matter of taste — sliders: the user sees the result while dragging. They combine:
@@ -114,7 +115,8 @@ files; `python3 $H demo NAME` opens one.
 
 Top level: `title`, `subtitle`, `source` (replaces "Claude is asking"), `context` (blocks),
 `width: "narrow"` (for short questions), `submitLabel`, `chat: false` (hide Discuss in chat), `script`
-(JS, see [Extending](#extending)), `style`, `review` (see [Look and summary](#look-and-summary)) and
+(JS, see [Extending](#extending)), `fragments` (see [Live regions](#live-regions-with-htmx)), `style`,
+`review` (see [Look and summary](#look-and-summary)) and
 **either** the fields of a single question **or** `questions: [...]` (tabs, answered in order).
 
 Question: `id`, `header`, `prompt`, `hint`, `body` (blocks), `recommendation` (a markdown banner with the
@@ -203,6 +205,32 @@ in the product's style, an animation, a filterable list), build it inside the qu
 - Use `controls` instead of hand-made sliders: keyboard, reset, presets, baseline and the summary come free.
 - Do not escape anything in ordinary fields — the runtime escapes them. `html`, `svg` and `js` are raw: never
   put foreign text (an issue body, a log line) there; put it in markdown or `code`.
+
+### Live regions with htmx
+
+Every page ships [htmx](https://htmx.org/) 2.0.11. Whatever changes while the page is open (progress, a log
+tail, a result that arrives later) is an `html` block with `hx-*` attributes, not hand-written `js`:
+
+```json
+{
+  "title": "Import",
+  "prompt": "Watching the import",
+  "fragments": "live",
+  "context": [{"html": "<div hx-get='/f/status.html' hx-trigger='load, every 2s'>Starting…</div>"}],
+  "text": false,
+  "optional": true,
+  "submitLabel": "Close"
+}
+```
+
+- `fragments` is a directory, absolute or relative to the spec. `GET /f/NAME` reads the file on every request:
+  rewrite `live/status.html` and the region updates. A file not written yet is a 404, the region stays as it was.
+- Start the page in the background as usual and keep working; the task ends when the user closes the page.
+- The server has only `GET /f/NAME`, with no subdirectories. Any other POST, `hx-post` included, ends the page
+  with an empty answer.
+- htmx scans the page once on load. Markup added later (`js` blocks, `api.block`, a `controls` preview redraw)
+  needs `htmx.process(el)`.
+- Fragments are raw HTML, so the rule for `html` applies: escape foreign text before writing it there.
 
 ## How the user answers
 

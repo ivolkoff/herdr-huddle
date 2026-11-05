@@ -146,7 +146,7 @@ def build_html(spec, base):
     def read(name):
         with open(os.path.join(RUNTIME, name), encoding="utf-8") as f:
             return f.read()
-    css, js = read("huddle.css"), read("huddle.js")
+    css, js, htmx = read("huddle.css"), read("huddle.js"), read("htmx.min.js")
     mm = mermaid_js() if uses_mermaid(spec) else ""
     data = json.dumps(spec, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\u0021--")
     title = spec.get("title") or (spec.get("questions") or [spec])[0].get("prompt") or "Question"
@@ -157,7 +157,8 @@ def build_html(spec, base):
         f"<title>{esc(title)[:120]}</title><style>{css}</style></head>"
         f"<body><div id=\"app\"></div><script type=\"application/json\" id=\"hd-spec\">{data}</script>"
         + (f"<script>{mm}</script>" if mm else "")
-        + f"<script>{js}</script></body></html>"
+        # htmx scans the DOM once on load, so it goes after the runtime that renders it
+        + f"<script>{js}</script><script>{htmx}</script></body></html>"
     )
 
 
@@ -257,7 +258,7 @@ def open_pane(url):
 RELOAD_GRACE = 3  # seconds a dismissal waits for the page to come back (a reload also unloads it)
 
 
-def ask_page(html, timeout, herdr):
+def ask_page(html, timeout, herdr, fragments=None):
     state = {"answer": None, "dismissed_at": None, "gen": 0}
     done = threading.Event()
     pane_file = None
@@ -266,7 +267,25 @@ def ask_page(html, timeout, herdr):
         def log_message(self, *a):
             pass
 
+        # apart from do_GET's page path: a poll is not a reload, and must not bump gen or reset the zoom
+        def send_fragment(self):
+            name = self.path[len("/f/"):].partition("?")[0]
+            path = os.path.join(fragments or "", name)
+            if not fragments or "/" in name or not os.path.isfile(path):
+                self.send_error(404)
+                return
+            with open(path, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
+            if self.path.startswith("/f/"):
+                self.send_fragment()
+                return
             state["dismissed_at"] = None  # the page is back: that unload was a reload
             state["gen"] += 1
             body = html.replace('<div id="app">', f'<script>window.HD_GEN={state["gen"]}</script><div id="app">', 1).encode()
@@ -339,7 +358,8 @@ def ask(spec, a, base):
     herdr = not a.browser and in_herdr()
     if not herdr and not a.browser and os.environ.get("HUDDLE_NO_BROWSER"):
         die("not inside herdr and HUDDLE_NO_BROWSER is set", 3)
-    return ask_page(html, a.timeout, herdr)
+    fragments = spec.get("fragments")
+    return ask_page(html, a.timeout, herdr, fragments and os.path.join(base, os.path.expanduser(fragments)))
 
 
 def quick_spec(a):

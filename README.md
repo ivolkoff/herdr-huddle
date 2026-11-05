@@ -10,7 +10,8 @@ zoomed over the agent's own pane; the answer comes back to the agent as JSON on 
 
 Options with subtitles, recommendations, pros and cons; previews (diagrams, charts, layouts, colors);
 sliders with a live preview for taste values; several questions on one page with a summary; a free-text
-note under every question. Everything works from the keyboard.
+note under every question; regions that update live through [htmx](https://htmx.org/), with or without a
+question. Everything works from the keyboard.
 
 ## Requirements
 
